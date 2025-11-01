@@ -1,0 +1,745 @@
+<?php
+include 'common.php';
+
+if (!defined('__TYPECHO_ADMIN__')) exit;
+
+/**
+ * GitHub-backed 附件管理（集成：排序、目录选择器、上传冲突处理、移动/复制/重命名/目录管理、预览与通知）
+ *
+ * 覆盖说明（完整单文件）：
+ * - 后端 action 支持：upload, list_all, delete, rename, move, copy, mkdir, rmdir, file_mtime, raw, preview
+ * - upload 支持 overwrite 与 autorename（默认自动重命名同名文件）
+ * - 前端：按文件名/上传时间排序（时间使用 commits API 按需查询并缓存）、目录选择器、点击缩略图预览、hover 动画、Typecho 风格通知
+ *
+ * 请先备份原始文件 admin/manage-medias.php 后再替换。上传/修改会写入临时日志（%TEMP%/gh_upload_debug.log 和 gh_api_debug.log）以便排错。
+ */
+
+// ----------------- Helpers / Config -----------------
+if (!function_exists('gh_cfg_raw')) {
+    function gh_cfg_raw() {
+        return [
+            'token'  => defined('GITHUB_ATTACHMENT_TOKEN') ? GITHUB_ATTACHMENT_TOKEN : '',
+            'owner'  => defined('GITHUB_ATTACHMENT_OWNER') ? GITHUB_ATTACHMENT_OWNER : '',
+            'repo'   => defined('GITHUB_ATTACHMENT_REPO') ? GITHUB_ATTACHMENT_REPO : '',
+            'branch' => defined('GITHUB_ATTACHMENT_BRANCH') ? GITHUB_ATTACHMENT_BRANCH : 'main',
+            'root'   => defined('GITHUB_ATTACHMENT_ROOT') ? trim(GITHUB_ATTACHMENT_ROOT, "/") : '',
+        ];
+    }
+}
+
+if (!function_exists('gh_is_configured')) {
+    function gh_is_configured() {
+        $c = gh_cfg_raw();
+        return (!empty($c['owner']) && !empty($c['repo']));
+    }
+}
+
+if (!function_exists('gh_error')) {
+    function gh_error($msg) {
+        if (!headers_sent()) header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['ok' => false, 'message' => (string)$msg]);
+        exit;
+    }
+}
+
+if (!function_exists('gh_ok')) {
+    function gh_ok($data = []) {
+        if (!headers_sent()) header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(array_merge(['ok' => true], (array)$data));
+        exit;
+    }
+}
+
+// Normalize path: accept display or repo path, prepend root if needed
+if (!function_exists('gh_path_normalize')) {
+    function gh_path_normalize($path) {
+        $cfg = gh_cfg_raw();
+        $root = rtrim($cfg['root'], '/');
+        $p = trim((string)$path, '/');
+
+        if ($root === '') {
+            return $p;
+        }
+        if ($p === '') return $root;
+        if (stripos($p, $root . '/') === 0 || strcasecmp($p, $root) === 0) return $p;
+        return $root . '/' . $p;
+    }
+}
+
+// HTTP helper to GitHub API (raw endpoints)
+if (!function_exists('gh_api_raw_request')) {
+    function gh_api_raw_request($method, $endpoint, $body = null, $isJson = true) {
+        $cfg = gh_cfg_raw();
+        if (empty($cfg['owner']) || empty($cfg['repo'])) {
+            return ['status' => 0, 'error' => 'GITHUB configuration missing'];
+        }
+        $url = "https://api.github.com/repos/{$cfg['owner']}/{$cfg['repo']}/{$endpoint}";
+        $ch = curl_init($url);
+
+        $headers = [
+            'Accept: application/vnd.github.v3+json',
+            'User-Agent: Typecho-GitHub-Attachment'
+        ];
+        if (!empty($cfg['token'])) {
+            $authType = defined('GITHUB_ATTACHMENT_AUTH_TYPE') ? strtolower(trim(GITHUB_ATTACHMENT_AUTH_TYPE)) : 'token';
+            $headers[] = ($authType === 'bearer' ? 'Authorization: Bearer ' : 'Authorization: token ') . $cfg['token'];
+        }
+        if ($isJson) $headers[] = 'Content-Type: application/json';
+
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+        if ($body !== null) {
+            $payload = $isJson ? json_encode($body) : $body;
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        } else {
+            $payload = null;
+        }
+
+        // CA detection (win/linux common paths)
+        $ca = '';
+        if (defined('GITHUB_ATTACHMENT_CACERT_PATH') && GITHUB_ATTACHMENT_CACERT_PATH) {
+            $p = GITHUB_ATTACHMENT_CACERT_PATH;
+            if (file_exists($p) && is_readable($p)) $ca = $p;
+        }
+        if (!$ca) {
+            $ini = ini_get('curl.cainfo');
+            if ($ini && file_exists($ini) && is_readable($ini)) $ca = $ini;
+        }
+        $possible = ['C:\\php\\extras\\ssl\\cacert.pem','C:\\php\\cacert.pem','/etc/ssl/certs/ca-certificates.crt','/etc/pki/tls/certs/ca-bundle.crt'];
+        if (!$ca) {
+            foreach ($possible as $pp) { if (file_exists($pp) && is_readable($pp)) { $ca = $pp; break; } }
+        }
+        if ($ca) {
+            curl_setopt($ch, CURLOPT_CAINFO, $ca);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        } else {
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        }
+
+        $resp = curl_exec($ch);
+        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+
+        $tmpLog = (strncasecmp(PHP_OS,'WIN',3)===0)?(getenv('TEMP')?:'C:\\Windows\\Temp').'\\gh_api_debug.log':'/tmp/gh_api_debug.log';
+        @file_put_contents($tmpLog, json_encode([
+            'time'=>date('c'),'method'=>$method,'endpoint'=>$endpoint,'status'=>$status,'curl_error'=>$err,
+            'request_body'=> ($payload && strlen($payload) < 20000 ? $payload : '[omitted]'),
+            'response'=> ($resp && strlen($resp) < 20000 ? $resp : (is_string($resp)?substr($resp,0,20000).'[trunc]':'')),
+        ], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT) . "\n\n", FILE_APPEND);
+
+        curl_close($ch);
+        if ($resp === false) return ['status'=>0,'error'=>$err];
+        $json = json_decode($resp, true);
+        return ['status'=>$status,'body'=>$json,'raw'=>$resp];
+    }
+}
+
+if (!function_exists('gh_api_request')) {
+    function gh_api_request($method, $apiPath, $body = null, $isJson = true) {
+        $apiPath = ltrim($apiPath, '/');
+        $branch = gh_cfg_raw()['branch'] ?: 'main';
+        $endpoint = "contents/{$apiPath}";
+        if ($branch) $endpoint .= '?ref=' . rawurlencode($branch);
+        return gh_api_raw_request($method, $endpoint, $body, $isJson);
+    }
+}
+
+// ----------------- Action dispatch -----------------
+$action = isset($_REQUEST['action']) ? $_REQUEST['action'] : '';
+
+// UPLOAD: overwrite=true to force overwrite; autorename default true
+if ($action === 'upload') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('contributor', true) && !$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+
+    $tmpLog = (strncasecmp(PHP_OS,'WIN',3)===0?(getenv('TEMP')?:'C:\\Windows\\Temp').'\\gh_upload_debug.log':'/tmp/gh_upload_debug.log');
+    @file_put_contents($tmpLog, date('c') . " UPLOAD REQUEST: " . print_r(['_POST'=>$_POST,'_FILES'=>$_FILES], true) . "\n\n", FILE_APPEND);
+
+    if (empty($_FILES['file'])) gh_error('没有发现上传文件（name 应为 "file"）');
+    $file = $_FILES['file'];
+    if ($file['error'] !== UPLOAD_ERR_OK) gh_error('文件上传错误: ' . $file['error']);
+
+    $path = isset($_POST['path']) ? trim((string)$_POST['path'], '/') : '';
+    $overwrite = (isset($_POST['overwrite']) && ($_POST['overwrite']=='1' || $_POST['overwrite']=='true')) ? true : false;
+    $autorename = (isset($_POST['autorename']) && ($_POST['autorename']=='0' || $_POST['autorename']=='false')) ? false : true;
+
+    $apiDir = gh_path_normalize($path);
+    $filename = basename($file['name']);
+    $target = ($apiDir === '') ? $filename : ($apiDir . '/' . $filename);
+
+    $content = @file_get_contents($file['tmp_name']);
+    if ($content === false) gh_error('无法读取上传临时文件');
+    $b64 = base64_encode($content);
+
+    // collision handling
+    $check = gh_api_request('GET', $target, null);
+    if (isset($check['status']) && $check['status'] === 200 && isset($check['body']['sha'])) {
+        if (!$overwrite) {
+            if ($autorename) {
+                $base = pathinfo($filename, PATHINFO_FILENAME);
+                $ext = pathinfo($filename, PATHINFO_EXTENSION);
+                $i = 1;
+                do {
+                    $candidate = $base . '-' . $i . ($ext ? ('.' . $ext) : '');
+                    $targetCandidate = ($apiDir === '') ? $candidate : ($apiDir . '/' . $candidate);
+                    $chk = gh_api_request('GET', $targetCandidate, null);
+                    $exists = (isset($chk['status']) && $chk['status'] === 200 && isset($chk['body']['sha']));
+                    $i++;
+                } while ($exists && $i < 1000);
+                if ($exists) gh_error('无法自动重命名：找到太多同名文件');
+                $target = $targetCandidate;
+                $filename = $candidate;
+            } else {
+                gh_error('目标文件已存在（同名）。如需覆盖请使用 overwrite=1');
+            }
+        } else {
+            // overwrite case: include sha from $check
+        }
+    }
+
+    $body = ['message' => "Upload via Typecho: {$filename}", 'content' => $b64, 'branch' => gh_cfg_raw()['branch']];
+    if (isset($check['status']) && $check['status'] === 200 && isset($check['body']['sha'])) {
+        $body['sha'] = $check['body']['sha'];
+    }
+
+    $res = gh_api_request('PUT', $target, $body);
+    @file_put_contents($tmpLog, date('c') . " GH PUT RESPONSE for {$target}: " . json_encode($res, JSON_UNESCAPED_UNICODE) . "\n\n", FILE_APPEND);
+
+    if (isset($res['status']) && ($res['status'] === 201 || $res['status'] === 200)) {
+        $cfg = gh_cfg_raw();
+        $rawUrl = (!empty($cfg['owner']) && !empty($cfg['repo'])) ? "https://raw.githubusercontent.com/{$cfg['owner']}/{$cfg['repo']}/{$cfg['branch']}/" . implode('/', array_map('rawurlencode', explode('/', $target))) : '';
+        gh_ok(['message' => '上传成功', 'file' => $target, 'url' => $rawUrl]);
+    } else {
+        $msg = $res['body']['message'] ?? ($res['error'] ?? ($res['status'] ?? '未知错误'));
+        gh_error('上传失败: ' . $msg);
+    }
+}
+
+// list_all (recursive tree, return images + dirs)
+if ($action === 'list_all') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('contributor', true) && !$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+
+    $cfg = gh_cfg_raw();
+    $branch = $cfg['branch'] ?: 'main';
+    $res = gh_api_raw_request('GET', "git/trees/".rawurlencode($branch)."?recursive=1", null);
+    if ($res['status'] !== 200) gh_error('GitHub git/trees API 错误: ' . ($res['body']['message'] ?? $res['status']));
+
+    $tree = $res['body']['tree'] ?? [];
+    $images = [];
+    $dirs = [];
+    $imageExt = ['png','jpg','jpeg','gif','webp','svg','bmp','ico','tiff','heic'];
+
+    foreach ($tree as $node) {
+        if (!isset($node['path']) || ($node['type'] ?? '') !== 'blob') continue;
+        $path = $node['path'];
+        if (!empty($cfg['root'])) {
+            if (strpos($path, $cfg['root'] . '/') !== 0) continue;
+            $displayPath = substr($path, strlen($cfg['root']) + 1);
+        } else {
+            $displayPath = $path;
+        }
+
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if (!in_array($ext, $imageExt)) continue;
+
+        $name = basename($path);
+        $rawUrl = "https://raw.githubusercontent.com/{$cfg['owner']}/{$cfg['repo']}/{$cfg['branch']}/" . implode('/', array_map('rawurlencode', explode('/', $path)));
+
+        $images[] = ['path' => $displayPath, 'full_path' => $path, 'name' => $name, 'url' => $rawUrl];
+
+        $parts = explode('/', $displayPath);
+        if (count($parts) > 1) {
+            array_pop($parts);
+            $prefix = '';
+            foreach ($parts as $p) {
+                $prefix = $prefix === '' ? $p : ($prefix . '/' . $p);
+                if (!in_array($prefix, $dirs)) $dirs[] = $prefix;
+            }
+        }
+    }
+
+    usort($images, function($a,$b){ return strcmp(strtolower($a['path']), strtolower($b['path'])); });
+    sort($dirs, SORT_STRING);
+    gh_ok(['images'=>$images, 'dirs'=>$dirs]);
+}
+
+// DELETE file
+if ($action === 'delete') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('contributor', true) && !$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+
+    $tmpLog = (strncasecmp(PHP_OS,'WIN',3)===0?(getenv('TEMP')?:'C:\\Windows\\Temp').'\\gh_api_debug.log':'/tmp/gh_api_debug.log');
+    @file_put_contents($tmpLog, date('c') . " DELETE REQUEST: " . print_r(['_GET'=>$_GET,'_POST'=>$_POST,'raw'=>file_get_contents('php://input')], true) . "\n\n", FILE_APPEND);
+
+    $path = isset($_POST['path']) ? $_POST['path'] : (isset($_GET['path']) ? $_GET['path'] : '');
+    if ($path === '') gh_error('请指定要删除的文件路径');
+
+    $target = gh_path_normalize($path);
+    $check = gh_api_request('GET', $target, null);
+    if (!isset($check['status']) || $check['status'] !== 200 || !isset($check['body']['sha'])) {
+        // try alternate
+        $cfg = gh_cfg_raw(); $root = rtrim($cfg['root'], '/');
+        if ($root !== '') {
+            if (stripos($target, $root . '/') === 0) $try = substr($target, strlen($root) + 1);
+            else $try = $root . '/' . ltrim($target, '/');
+            $check2 = gh_api_request('GET', $try, null);
+            if (isset($check2['status']) && $check2['status'] === 200 && isset($check2['body']['sha'])) { $check = $check2; $target = $try; }
+        }
+    }
+    if (!isset($check['status']) || $check['status'] !== 200 || !isset($check['body']['sha'])) {
+        @file_put_contents($tmpLog, date('c') . " DELETE FAILED: no sha for {$target}\n" . json_encode($check, JSON_UNESCAPED_UNICODE) . "\n\n", FILE_APPEND);
+        gh_error('目标文件不存在或无法获取 sha（' . htmlspecialchars($target) . '）');
+    }
+    $sha = $check['body']['sha'];
+    $body = ['message' => "Delete via Typecho: {$path}", 'sha' => $sha, 'branch' => gh_cfg_raw()['branch']];
+    $res = gh_api_request('DELETE', $target, $body);
+    @file_put_contents($tmpLog, date('c') . " DELETE GH RESPONSE: " . json_encode($res, JSON_UNESCAPED_UNICODE) . "\n\n", FILE_APPEND);
+    if (isset($res['status']) && $res['status'] === 200) gh_ok(['message' => '删除成功']);
+    else { $msg = $res['body']['message'] ?? ($res['error'] ?? ($res['status'] ?? 'Unknown')); gh_error('删除失败: ' . $msg); }
+}
+
+// RENAME (copy then delete)
+if ($action === 'rename') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+    $src = isset($_POST['src']) ? trim((string)$_POST['src'], '/') : '';
+    $dst = isset($_POST['dst']) ? trim((string)$_POST['dst'], '/') : '';
+    if ($src === '' || $dst === '') gh_error('请指定 src 与 dst');
+
+    $srcTarget = gh_path_normalize($src);
+    $dstTarget = gh_path_normalize($dst);
+
+    $get = gh_api_request('GET', $srcTarget, null);
+    if ($get['status'] !== 200 || !isset($get['body']['content'])) gh_error('无法读取源文件');
+
+    $content_b64 = $get['body']['content'];
+    $createBody = ['message' => "Rename via Typecho: {$src} -> {$dst}", 'content' => $content_b64, 'branch' => gh_cfg_raw()['branch']];
+    $create = gh_api_request('PUT', $dstTarget, $createBody);
+    if (!in_array($create['status'], [200,201])) gh_error('复制到目标失败: ' . ($create['body']['message'] ?? $create['status']));
+    $sha = $get['body']['sha'];
+    $del = gh_api_request('DELETE', $srcTarget, ['message' => "Remove after rename: {$src}", 'sha' => $sha, 'branch' => gh_cfg_raw()['branch']]);
+    if ($del['status'] === 200) gh_ok(['message' => '重命名成功']); else gh_error('重命名后删除源失败: ' . ($del['body']['message'] ?? $del['status']));
+}
+
+// MOVE (alias rename)
+if ($action === 'move') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+    $src = isset($_POST['src']) ? trim((string)$_POST['src'], '/') : (isset($_GET['src'])?trim((string)$_GET['src'],'/'):'');
+    $dst = isset($_POST['dst']) ? trim((string)$_POST['dst'], '/') : (isset($_GET['dst'])?trim((string)$_GET['dst'],'/'):'');
+    if ($src === '' || $dst === '') gh_error('请指定 src 与 dst');
+    // reuse rename above logic
+    $srcTarget = gh_path_normalize($src);
+    $dstTarget = gh_path_normalize($dst);
+    $get = gh_api_request('GET', $srcTarget, null);
+    if ($get['status'] !== 200 || !isset($get['body']['content'])) gh_error('无法读取源文件');
+    $content_b64 = $get['body']['content'];
+    $createBody = ['message' => "Move via Typecho: {$src} -> {$dst}", 'content' => $content_b64, 'branch' => gh_cfg_raw()['branch']];
+    $create = gh_api_request('PUT', $dstTarget, $createBody);
+    if (!in_array($create['status'], [200,201])) gh_error('复制到目标失败: ' . ($create['body']['message'] ?? $create['status']));
+    $sha = $get['body']['sha'];
+    $del = gh_api_request('DELETE', $srcTarget, ['message' => "Remove after move: {$src}", 'sha' => $sha, 'branch' => gh_cfg_raw()['branch']]);
+    if ($del['status'] === 200) gh_ok(['message' => '移动成功']); else gh_error('移动后删除源失败: ' . ($del['body']['message'] ?? $del['status']));
+}
+
+// COPY file
+if ($action === 'copy') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+    $src = isset($_POST['src']) ? trim((string)$_POST['src'], '/') : (isset($_GET['src'])?trim((string)$_GET['src'],'/'):'');
+    $dst = isset($_POST['dst']) ? trim((string)$_POST['dst'], '/') : (isset($_GET['dst'])?trim((string)$_GET['dst'],'/'):'');
+    if ($src === '' || $dst === '') gh_error('请指定 src 与 dst');
+    $srcTarget = gh_path_normalize($src);
+    $dstTarget = gh_path_normalize($dst);
+    $get = gh_api_request('GET', $srcTarget, null);
+    if ($get['status'] !== 200 || !isset($get['body']['content'])) gh_error('无法读取源文件');
+    $content_b64 = $get['body']['content'];
+    $createBody = ['message' => "Copy via Typecho: {$src} -> {$dst}", 'content' => $content_b64, 'branch' => gh_cfg_raw()['branch']];
+    $create = gh_api_request('PUT', $dstTarget, $createBody);
+    if (in_array($create['status'], [200,201])) gh_ok(['message' => '复制成功']); else gh_error('复制失败: ' . ($create['body']['message'] ?? $create['status']));
+}
+
+// MKDIR
+if ($action === 'mkdir') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+    $path = isset($_POST['path']) ? trim((string)$_POST['path'], '/') : '';
+    if ($path === '') gh_error('请指定目录 path');
+    $dir = gh_path_normalize($path);
+    $keepPath = $dir . '/.gitkeep';
+    $check = gh_api_request('GET', $keepPath, null);
+    if (isset($check['status']) && $check['status'] === 200) gh_error('目录已存在');
+    $body = ['message' => "Create dir via Typecho: {$path}", 'content' => base64_encode(''), 'branch' => gh_cfg_raw()['branch']];
+    $res = gh_api_request('PUT', $keepPath, $body);
+    if ($res['status'] === 201) gh_ok(['message' => '目录创建成功']);
+    else gh_error('目录创建失败: ' . ($res['body']['message'] ?? $res['status']));
+}
+
+// RMDIR recursive
+if ($action === 'rmdir') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('administrator', true)) gh_error('仅 admin 可删除目录');
+    $path = isset($_POST['path']) ? trim((string)$_POST['path'], '/') : (isset($_GET['path'])?trim((string)$_GET['path'],'/'):'');
+    if ($path === '') gh_error('请指定要删除的目录 path');
+    $cfg = gh_cfg_raw();
+    $branch = $cfg['branch'] ?: 'main';
+    $prefix = gh_path_normalize($path);
+    $treeRes = gh_api_raw_request('GET', "git/trees/".rawurlencode($branch)."?recursive=1", null);
+    if ($treeRes['status'] !== 200) gh_error('无法列出仓库树: ' . ($treeRes['body']['message'] ?? $treeRes['status']));
+    $filesToDelete = [];
+    foreach ($treeRes['body']['tree'] as $node) {
+        if (($node['type'] ?? '') !== 'blob') continue;
+        $nodePath = $node['path'];
+        if (stripos($nodePath, rtrim($prefix,'/') . '/') === 0) $filesToDelete[] = $nodePath;
+    }
+    if (empty($filesToDelete)) gh_error('目录为空或不存在');
+    $tmpLog = (strncasecmp(PHP_OS,'WIN',3)===0?(getenv('TEMP')?:'C:\\Windows\\Temp').'\\gh_api_debug.log':'/tmp/gh_api_debug.log');
+    @file_put_contents($tmpLog, date('c') . " RMDIR: deleting " . count($filesToDelete) . " files under {$prefix}\n", FILE_APPEND);
+    $failed = [];
+    foreach ($filesToDelete as $fpath) {
+        $get = gh_api_request('GET', $fpath, null);
+        if (!isset($get['status']) || $get['status'] !== 200 || !isset($get['body']['sha'])) { $failed[] = $fpath; continue; }
+        $sha = $get['body']['sha'];
+        $del = gh_api_request('DELETE', $fpath, ['message' => "Remove dir {$path}: delete {$fpath}", 'sha' => $sha, 'branch' => $branch]);
+        if (!isset($del['status']) || $del['status'] !== 200) $failed[] = $fpath;
+    }
+    if (empty($failed)) gh_ok(['message' => '目录已删除']);
+    else gh_error('部分删除失败：' . implode(', ', array_slice($failed,0,10)));
+}
+
+// file_mtime: returns ISO date of latest commit affecting file
+if ($action === 'file_mtime') {
+    if (!gh_is_configured()) gh_error('GitHub 未配置');
+    if (!$user->pass('contributor', true) && !$user->pass('editor', true) && !$user->pass('administrator', true)) gh_error('权限不足');
+    $path = isset($_GET['path']) ? trim((string)$_GET['path'], '/') : '';
+    if ($path === '') gh_error('请指定 path');
+    $cfg = gh_cfg_raw();
+    $apiPath = gh_path_normalize($path);
+    $endpoint = 'commits?path=' . rawurlencode($apiPath) . '&sha=' . rawurlencode($cfg['branch']) . '&per_page=1';
+    $res = gh_api_raw_request('GET', $endpoint, null);
+    if (!isset($res['status']) || $res['status'] !== 200) gh_error('无法获取提交信息: ' . ($res['body']['message'] ?? $res['status']));
+    $commits = $res['body'];
+    if (!is_array($commits) || count($commits) === 0) gh_ok(['mtime' => null]);
+    else {
+        $date = $commits[0]['commit']['author']['date'] ?? ($commits[0]['commit']['committer']['date'] ?? null);
+        gh_ok(['mtime' => $date]);
+    }
+}
+
+// raw proxy for preview
+if ($action === 'raw') {
+    $path = isset($_GET['path']) ? $_GET['path'] : '';
+    if ($path === '') gh_error('请指定 path');
+    $apiPath = gh_path_normalize($path);
+    $get = gh_api_request('GET', $apiPath, null);
+    if ($get['status'] !== 200) gh_error('无法获取文件: ' . ($get['body']['message'] ?? $get['status']));
+    $fileBody = $get['body'];
+    $content = base64_decode($fileBody['content']);
+    $ext = pathinfo($apiPath, PATHINFO_EXTENSION);
+    $ctype = \Typecho\Common::mimeType($ext) ?: 'application/octet-stream';
+    header('Content-Type: ' . $ctype);
+    echo $content;
+    exit;
+}
+
+// preview returns public raw URL and proxy URL
+if ($action === 'preview') {
+    $path = isset($_GET['path']) ? $_GET['path'] : '';
+    if ($path === '') gh_error('请指定 path');
+    $apiPath = gh_path_normalize($path);
+    $cfg = gh_cfg_raw();
+    $rawUrl = "https://raw.githubusercontent.com/{$cfg['owner']}/{$cfg['repo']}/{$cfg['branch']}/" . $apiPath;
+    gh_ok(['preview' => $rawUrl, 'rawProxy' => $options->adminUrl('manage-medias.php?action=raw&path=' . rawurlencode($path))]);
+}
+
+// End of action handling - continue to render page if no action returned JSON
+include 'header.php';
+include 'menu.php';
+?>
+<style>
+/* Typecho-friendly clean styles + hover animation + picker */
+#github-file-manager { padding-top: 6px; }
+.manager-controls { margin:8px 0 12px 0; display:flex; gap:8px; align-items:center; }
+.btn-primary { background:#2d7ad6;color:#fff;padding:6px 10px;border-radius:4px;border:0; }
+
+/* left filter box white background */
+.filter-box { background:#fff;border:1px solid #efefef;padding:10px;border-radius:4px; }
+.dir-search { width:100%; padding:7px; margin-bottom:8px; border:1px solid #eee; border-radius:4px; font-size:13px; }
+.dir-list { max-height:420px; overflow:auto; margin:0; padding:0; list-style:none; }
+
+/* gallery */
+.gallery-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap:12px; }
+.gallery-item { background:#fff;border-radius:6px; overflow:hidden; border:1px solid #eee; display:flex; flex-direction:column; position:relative; transition: transform .18s ease, box-shadow .18s ease; }
+.gallery-item:hover { transform: translateY(-6px); box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+.gallery-thumb { width:100%; height:140px; object-fit:cover; background:#fafafa; display:block; cursor:pointer; transition: transform .18s ease; }
+.gallery-item:hover .gallery-thumb { transform: scale(1.03); }
+.thumb-overlay { position:absolute; left:0; right:0; top:0; height:140px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:600; background:rgba(0,0,0,0.28); opacity:0; transition:opacity .12s ease; }
+.gallery-item:hover .thumb-overlay { opacity:1; }
+
+/* dir picker modal */
+#dir-picker { display:none; position:fixed; left:0; right:0; top:0; bottom:0; align-items:center; justify-content:center; background:rgba(0,0,0,0.45); z-index:10000; }
+#dir-picker .inner { background:#fff; padding:14px; border-radius:6px; width:480px; max-width:95%; max-height:80vh; overflow:auto; }
+#dir-picker ul { list-style:none; padding:0; margin:0; max-height:320px; overflow:auto; }
+#dir-picker li { padding:8px; cursor:pointer; border-bottom:1px solid #f2f2f2; }
+#dir-picker li:hover { background:#f7faff; }
+#dir-picker .choose { margin-top:10px; text-align:right; }
+
+.gf-empty { padding:20px; color:#666; text-align:center; }
+</style>
+
+<main class="main">
+    <div class="body container">
+        <?php include 'page-title.php'; ?>
+
+        <div class="manager-controls">
+            <button id="gf-refresh" class="btn-primary">刷新所有图片</button>
+            <!-- sort UI injected by JS -->
+        </div>
+
+        <div class="row typecho-page-main" role="main">
+            <div class="col-mb-12">
+                <?php if (!gh_is_configured()): ?>
+                    <div class="p"><h3><?php _e('GitHub 附件管理未配置'); ?></h3><p><?php _e('请在 config.inc.php 中添加 GITHUB_ATTACHMENT_OWNER 与 GITHUB_ATTACHMENT_REPO'); ?></p></div>
+                <?php else: ?>
+                <div id="github-file-manager" class="p">
+                    <div class="gallery-top" style="display:flex;gap:14px;align-items:flex-start;">
+                        <div class="gallery-left" style="width:260px;">
+                            <div class="filter-box">
+                                <div class="filter-title">目录筛选</div>
+                                <input id="dir-search" class="dir-search" type="text" placeholder="筛选目录...">
+                                <ul id="dir-list" class="dir-list" style="margin-top:6px;"></ul>
+
+                                <div style="margin-top:10px;">
+                                    <div class="filter-title">上传</div>
+                                    <div id="gf-upload-area" class="upload-area" data-url="<?php echo $options->adminUrl('manage-medias.php?action=upload'); ?>"><?php _e('拖放或点击上传'); ?></div>
+                                    <div style="margin-top:8px;font-size:12px;color:#666;">同名文件：默认自动重命名；可在上传时设置 overwrite=1 覆盖</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="gallery-right" style="flex:1;">
+                            <div id="gallery" class="gallery-grid" aria-live="polite"></div>
+                            <div id="gallery-empty" class="gf-empty" style="display:none;padding:20px;text-align:center;color:#666;">没有图片</div>
+                        </div>
+                    </div>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+</main>
+
+<!-- dir picker modal -->
+<div id="dir-picker" aria-hidden="true">
+  <div class="inner">
+    <h4>选择目标目录</h4>
+    <input id="dir-picker-search" type="text" placeholder="筛选目录..." style="width:100%;padding:6px;border:1px solid #eee;border-radius:4px;margin-bottom:8px;" />
+    <ul id="dir-picker-list"></ul>
+    <div style="margin-top:10px;">
+      <input id="dir-picker-custom" type="text" placeholder="或手动输入相对目录" style="width:70%;padding:6px;border:1px solid #eee;border-radius:4px;" />
+      <div class="choose">
+        <button id="dir-picker-cancel" class="btn">取消</button>
+        <button id="dir-picker-ok" class="btn btn-primary">选择</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- preview modal -->
+<div id="gf-modal" class="gf-modal" role="dialog" aria-hidden="true">
+    <div class="gf-modal-inner" role="document">
+        <button id="gf-modal-close" class="gf-modal-close" aria-label="关闭">关闭</button>
+        <div class="gf-modal-viewport" id="gf-modal-content"></div>
+        <div id="gf-modal-caption" class="gf-modal-caption"></div>
+    </div>
+</div>
+
+<?php
+include 'copyright.php';
+include 'common-js.php';
+?>
+
+<script>
+(function($){
+    const apiUrl = '<?php echo $options->adminUrl('manage-medias.php'); ?>';
+    const ghCfg = <?php echo json_encode(gh_cfg_raw()); ?>;
+    let allImages = [];
+    let currentFilterDir = '';
+
+    // API convenience
+    function apiGet(action, data){ data = data || {}; data.action = action; return $.getJSON(apiUrl, data); }
+    function apiPost(action, data){ data = data || {}; data.action = action; return $.ajax({ url: apiUrl, method:'POST', data: data, dataType:'json' }); }
+
+    function escapeHtml(s){ return String(s).replace(/[&<>"'\/]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;'}[c]; }); }
+    function escapeAttr(s){ return String(s).replace(/"/g,'&quot;'); }
+
+    // show Typecho-style popup
+    function showNotice(message, type) {
+        type = type || 'success';
+        var $msg = $('<div class="message popup ' + type + '"><ul><li></li></ul></div>');
+        $msg.find('li').text(message);
+        var $head = $('.typecho-head-nav');
+        if ($head.length) {
+            $msg.insertAfter($head);
+            var offset = $head.outerHeight() || 0;
+            $msg.css({ position: 'absolute', top: offset });
+            $(window).on('scroll.typechoMsg', function(){
+                if ($(window).scrollTop() >= offset) $msg.css({ position: 'fixed', top: 0 });
+                else $msg.css({ position: 'absolute', top: offset });
+            });
+        } else $msg.prependTo(document.body);
+        $msg.hide().slideDown(180);
+        setTimeout(function(){ $msg.fadeOut(300, function(){ $(this).remove(); $(window).off('scroll.typechoMsg'); });}, 3500);
+    }
+
+    function renderDirs(list) {
+        const $ul = $('#dir-list').empty();
+        $ul.append('<li class="dir-item active" data-dir="">全部</li>');
+        (list || []).forEach(function(d){ $('<li class="dir-item"></li>').text(d).attr('data-dir', d).appendTo($ul); });
+    }
+
+    function renderGallery(images) {
+        const $g = $('#gallery').empty();
+        if (!images || images.length === 0) { $('#gallery-empty').show(); return; }
+        $('#gallery-empty').hide();
+        images.forEach(function(img){
+            const $item = $('<div class="gallery-item"></div>');
+            const $img = $('<img class="gallery-thumb" loading="lazy">').attr('src', img.url).attr('alt', img.name);
+            $item.append($img);
+            $item.append('<div class="thumb-overlay"><span class="icon">&#128269;</span> 点击预览</div>');
+            $item.append('<div class="gallery-meta"><div style="overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">' + escapeHtml(img.name) + '</div><div style="color:#888;font-size:12px;">' + escapeHtml(img.path) + '</div></div>');
+            const $actions = $('<div class="gallery-actions"></div>');
+            $actions.append('<a href="#" class="preview-link" data-path="'+ encodeURIComponent(img.full_path) +'" data-name="'+ escapeAttr(img.name) +'">预览</a>');
+            $actions.append('<a href="#" class="detail-link" data-path="'+ encodeURIComponent(img.full_path) +'" data-name="'+ escapeAttr(img.name) +'">详情</a>');
+            $actions.append('<a href="#" class="rename-link" data-path="'+ encodeURIComponent(img.full_path) +'">重命名</a>');
+            $actions.append('<a href="#" class="move-link" data-path="'+ encodeURIComponent(img.full_path) +'">移动</a>');
+            $actions.append('<a href="#" class="copy-link" data-path="'+ encodeURIComponent(img.full_path) +'">复制</a>');
+            $actions.append('<a href="#" class="delete-link" data-path="'+ encodeURIComponent(img.full_path) +'">删除</a>');
+            $item.append($actions);
+            $item.data('img', img);
+            $g.append($item);
+        });
+    }
+
+    // initial load replaced by enhanced loader in earlier snippet
+    window.loadAllImages = function(){
+        $('#gallery').html('<div class="gf-empty">加载图片中…</div>');
+        apiGet('list_all').done(function(res){
+            if (!res || !res.ok) { $('#gallery').empty(); $('#gallery-empty').show().text(res && res.message ? res.message : '加载失败'); return; }
+            allImages = res.images || [];
+            renderGallery(allImages);
+            renderDirs(res.dirs || []);
+            // also populate picker list if exists
+            if (typeof renderDirPickerList === 'function') renderDirPickerList(res.dirs || []);
+        }).fail(function(){ $('#gallery').empty(); $('#gallery-empty').show().text('加载失败'); });
+    };
+
+    // central file operations (delete / rename / move / copy) handled via apiPost wrappers
+    function deleteImage(path) {
+        if (!path) { showNotice('删除路径为空','error'); return; }
+        if (!confirm('确认删除 ' + path + ' ?')) return;
+        apiPost('delete', { path: path }).done(function(res){ if (!res || !res.ok) { showNotice(res && res.message ? res.message : '删除失败','error'); return; } showNotice(res.message || '删除成功','success'); setTimeout(loadAllImages, 420); }).fail(function(xhr){ showNotice((xhr.responseJSON && xhr.responseJSON.message) || '删除失败','error'); });
+    }
+
+    function renameFile(src) {
+        var dst = prompt('输入新的目标路径（包含文件名），例如 subdir/newname.jpg', src);
+        if (!dst) return;
+        apiPost('rename', { src: src, dst: dst }).done(function(res){ if (!res || !res.ok) { showNotice(res && res.message ? res.message : '重命名失败','error'); return; } showNotice(res.message || '重命名成功','success'); setTimeout(loadAllImages,350); }).fail(function(xhr){ showNotice((xhr.responseJSON && xhr.responseJSON.message) || '重命名失败','error'); });
+    }
+
+    function moveFile(src) {
+        const defaultDir = currentFilterDir || '';
+        openDirPicker(defaultDir, function(chosen){
+            if (chosen === null) return;
+            const filename = src.split('/').pop();
+            const dst = (chosen ? (chosen.replace(/\/$/,'') + '/' + filename) : filename);
+            apiPost('move', { src: src, dst: dst }).done(function(res){ if (!res || !res.ok) { showNotice(res && res.message ? res.message : '移动失败','error'); return; } showNotice(res.message || '移动成功','success'); setTimeout(loadAllImages,350); }).fail(function(xhr){ showNotice((xhr.responseJSON && xhr.responseJSON.message) || '移动失败','error'); });
+        });
+    }
+
+    function copyFile(src) {
+        const defaultDir = currentFilterDir || '';
+        openDirPicker(defaultDir, function(chosen){
+            if (chosen === null) return;
+            const filename = src.split('/').pop();
+            const dst = (chosen ? (chosen.replace(/\/$/,'') + '/' + filename) : filename);
+            apiPost('copy', { src: src, dst: dst }).done(function(res){ if (!res || !res.ok) { showNotice(res && res.message ? res.message : '复制失败','error'); return; } showNotice(res.message || '复制成功','success'); setTimeout(loadAllImages,350); }).fail(function(xhr){ showNotice((xhr.responseJSON && xhr.responseJSON.message) || '复制失败','error'); });
+        });
+    }
+
+    // upload handling (drag/drop + click)
+    function handleFiles(files) {
+        for (let i=0;i<files.length;i++) uploadFile(files[i]);
+    }
+    function uploadFile(file) {
+        const defaultDir = currentFilterDir || '';
+        openDirPicker(defaultDir, function(chosen){
+            if (chosen === null) return;
+            const fd = new FormData();
+            fd.append('action','upload');
+            fd.append('path', chosen || '');
+            fd.append('file', file);
+            fd.append('autorename','1');
+            $.ajax({ url: apiUrl, data: fd, type: 'POST', dataType: 'json', contentType: false, processData: false,
+                success: function(res) { if (!res || !res.ok) { showNotice(res && res.message ? res.message : '上传失败','error'); return; } showNotice(res.message || '上传成功','success'); setTimeout(loadAllImages, 350); },
+                error: function(xhr) { var msg = '上传失败'; try { msg = (xhr.responseJSON && xhr.responseJSON.message) ? xhr.responseJSON.message : (xhr.responseText ? xhr.responseText.replace(/<\/?[^>]+(>|$)/g, '').trim().split('\n')[0] : msg); } catch(e){} showNotice(msg,'error'); console.error('UPLOAD failed', xhr); }
+            });
+        });
+    }
+
+    $(function(){
+        if ($('#github-file-manager').length === 0) return;
+        // init
+        loadAllImages();
+
+        $('#gf-refresh').on('click', function(){ loadAllImages(); });
+
+        $('#dir-list').on('click', '.dir-item', function(){
+            $('#dir-list .dir-item').removeClass('active'); $(this).addClass('active');
+            const dir = $(this).data('dir') || ''; currentFilterDir = dir;
+            if (dir === '') renderGallery(allImages); else { const filtered = allImages.filter(function(it){ return it.path.indexOf(dir) === 0; }); renderGallery(filtered); }
+        });
+
+        $('#dir-search').on('input', function(){ const q = $(this).val().toLowerCase(); $('#dir-list .dir-item').each(function(){ const txt = $(this).text().toLowerCase(); $(this).toggle(txt.indexOf(q) !== -1); }); });
+
+        const $area = $('#gf-upload-area');
+        $area.on('dragover', function(e){ e.preventDefault(); $area.addClass('drag'); });
+        $area.on('dragleave drop', function(e){ e.preventDefault(); $area.removeClass('drag'); });
+        $area.on('drop', function(e){ e.preventDefault(); handleFiles(e.originalEvent.dataTransfer.files); });
+        $area.on('click', function(){ const $f = $('<input type="file" />'); $f.on('change', function(){ handleFiles(this.files); }); $f.trigger('click'); });
+
+        // actions
+        $('#gallery').on('click', '.preview-link', function(e){ e.preventDefault(); const fp = decodeURIComponent($(this).data('path')); const name = $(this).data('name'); const raw = buildPublicRawUrl(fp) || (apiUrl + '?action=raw&path=' + encodeURIComponent(fp)); $('#gf-modal-content').html('<img src="'+ raw +'" alt="'+ escapeAttr(name) +'" />'); $('#gf-modal-caption').text(name || ''); $('#gf-modal').addClass('show').attr('aria-hidden','false'); });
+        $('#gallery').on('click', '.rename-link', function(e){ e.preventDefault(); const src = decodeURIComponent($(this).data('path')); renameFile(src); });
+        $('#gallery').on('click', '.move-link', function(e){ e.preventDefault(); const src = decodeURIComponent($(this).data('path')); moveFile(src); });
+        $('#gallery').on('click', '.copy-link', function(e){ e.preventDefault(); const src = decodeURIComponent($(this).data('path')); copyFile(src); });
+        $('#gallery').on('click', '.delete-link', function(e){ e.preventDefault(); const path = decodeURIComponent($(this).data('path') || ''); deleteImage(path); });
+
+        $('#gf-modal-close').on('click', function(){ $('#gf-modal').removeClass('show').attr('aria-hidden','true'); $('#gf-modal-content').empty(); $('#gf-modal-caption').text(''); });
+        $('#gf-modal').on('click', function(e){ if (e.target === this) { $('#gf-modal-close').click(); } });
+    });
+
+    // Dir picker helpers (renderDirPickerList & openDirPicker used above)
+    function renderDirPickerList(dirs) {
+        const $ul = $('#dir-picker-list').empty();
+        (dirs || []).forEach(function(d){ $ul.append('<li data-dir="'+ escapeAttr(d) +'">' + escapeHtml(d) + '</li>'); });
+        $('#dir-picker-search').off('input').on('input', function(){ const q = $(this).val().toLowerCase(); $('#dir-picker-list li').each(function(){ $(this).toggle($(this).text().toLowerCase().indexOf(q) !== -1); }); });
+        $('#dir-picker-list').on('click','li', function(){ $('#dir-picker-list li').removeClass('selected'); $(this).addClass('selected'); $('#dir-picker-custom').val($(this).data('dir')); });
+    }
+    function openDirPicker(defaultDir, callback) {
+        $('#dir-picker-custom').val(defaultDir || ''); $('#dir-picker').fadeIn(120).attr('aria-hidden','false');
+        $('#dir-picker-ok').off('click').on('click', function(){ const chosen = $('#dir-picker-custom').val().trim(); $('#dir-picker').fadeOut(120).attr('aria-hidden','true'); callback(chosen); });
+        $('#dir-picker-cancel').off('click').on('click', function(){ $('#dir-picker').fadeOut(120).attr('aria-hidden','true'); callback(null); });
+    }
+
+})(jQuery);
+</script>
+
+<?php
+include 'table-js.php';
+include 'footer.php';
+?>
